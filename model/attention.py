@@ -24,22 +24,16 @@ class MultiHeadAttention(nn.Module):
         self.Wi_V = nn.Linear(d_model , d_model)
         self.W_o = nn.Linear(d_model , d_model)
     
-    def forward(self, X, mask=None):
-        # shape of X is (batch, sequence ,d_model)
-        batch , sequence , d_model = X.size()
-        query = self.Wi_Q(X) # Output shape = (batch , sequence , d_model)
-        query = query.view(batch , sequence , self.h, self.dk)
-        query = query.transpose(1 , 2) # (batch , head, sequence , dk)
-        key = self.Wi_K(X) # Output shape = (batch , sequence , d_model)
-        key = key.view(batch , sequence , self.h, self.dk)
-        key = key.transpose(1 , 2) # (batch , head, sequence , dk)
-        value = self.Wi_V(X) # Output shape = (batch , sequence , d_model)
-        value = value.view(batch , sequence , self.h, self.dk)
-        value = value.transpose(1 , 2) # (batch , head, sequence , dk)
-        attention_out = scaled_dot_product(query , key, value)
-        attention_out = attention_out.transpose(1, 2).contiguous()
-        attention_out = attention_out.view(batch , sequence , self.d_model)
-        output = self.W_o(attention_out)
+    def forward(self, q, k, v, mask=None):
+        batch = q.size(0)
+        query = self.Wi_Q(q).view(batch, -1, self.h, self.dk).transpose(1,2)
+        key = self.Wi_K(k).view(batch, -1, self.h, self.dk).transpose(1,2)
+        value = self.Wi_V(v).view(batch, -1, self.h, self.dk).transpose(1,2)
+        attention_out = scaled_dot_product(query, key, value, mask)
+        attention_out = attention_out.transpose(1,2).contiguous()
+        output = self.W_o(attention_out.view(batch, -1, self.d_model))
+
+        
         return output
 
 #------------------------PPE-------------------
@@ -86,7 +80,7 @@ class encoder_layer(nn.Module):
 
     def forward(self, x, mask=None):
         res = x
-        x = self.mha(x, mask=mask)
+        x = self.mha(x, x, x,mask=mask)
         
         x = self.flayer_norm(res + self.dropout(x))
         res = x
@@ -94,6 +88,85 @@ class encoder_layer(nn.Module):
         
         x = self.slayer_norm(res + self.dropout(x))
         return x
+
+class decoder_layer(nn.Module):
+    def __init__(self, d_model, d_ff, h, dropout=0.1):
+        super().__init__()
+        self.self_attn = MultiHeadAttention(h, d_model)
+        self.cross_attn = MultiHeadAttention(h, d_model)
+        self.ffn = FFN(d_model, d_ff, dropout)
+        self.flayer_norm = nn.LayerNorm(d_model)
+        self.slayer_norm = nn.LayerNorm(d_model)
+        self.tlayer_norm = nn.LayerNorm(d_model)
+
+        self.dropout = nn.Dropout(dropout)
+    def forward(self, x , enc_out,src_mask, target_mask):
+        # x = decoder sequence
+        # first sublayer
+        res = x 
+        x = self.self_attn(x,x,x,mask=target_mask)
+        x = self.flayer_norm(res + self.dropout(x))
+        # second sublayer query from decoder which is x , key value from encoder
+        query = x 
+        out = self.cross_attn(query,enc_out,enc_out,mask=src_mask)
+        out = self.slayer_norm(query + self.dropout(out))
+        temp = out
+        out = self.ffn(out)
+        out = self.tlayer_norm(temp + self.dropout(out))
+
+        return out 
+        
+class Decoder(nn.Module):
+    def __init__(self,vocab_size, N_layers, d_model, max_len, d_ff, h):
+        super().__init__()
+        self.d_model = d_model
+        self.pos_encoding = positional_encoding(d_model, max_len)
+        self.word_embedding = nn.Embedding(vocab_size, d_model)
+        self.block = nn.ModuleList([decoder_layer(d_model, d_ff, h, dropout=0.1) for _ in range(N_layers)])   
+    
+    def forward(self, x, enc_out, src_mask, target_mask):
+        x = self.word_embedding(x) * math.sqrt(self.d_model)
+        x = self.pos_encoding(x)
+        
+        for layer in self.block:
+            x = layer(x, enc_out, src_mask, target_mask)
+        return x
+
+
+
+
+class Encoder(nn.Module):
+    def __init__(self, vocab_size, N_layers, d_model, max_len , d_ff, h):
+        super().__init__()
+        self.d_model = d_model
+        
+        
+        self.pos_encoding = positional_encoding(d_model, max_len)
+        self.word_embedding = nn.Embedding(vocab_size, d_model)
+        
+        self.block = nn.ModuleList([encoder_layer(d_model, d_ff, h, dropout=0.1) for _ in range(N_layers)])
+
+    def forward(self , x, mask=None):
+        
+        x = self.word_embedding(x) * math.sqrt(self.d_model)
+        x = self.pos_encoding(x)
+        for layer in self.block:
+            x = layer(x, mask)
+        return x
+
+class Transformer(nn.Module):
+    def __init__(self, encoder, decoder ,src_vocab_size, trg_vocab_size,N_layers, d_model, max_len , d_ff, h):
+        super().__init__()
+        self.encoder = Encoder(src_vocab_size, N_layers, d_model, max_len, d_ff, h)
+        self.decoder = Decoder(trg_vocab_size, N_layers, d_model, max_len, d_ff, h)
+        self.linear = nn.Linear(d_model, trg_vocab_size)
+    
+    def forward(self, src , trg , src_mask , trg_mask):
+        out = self.encoder(src, mask=src_mask)
+        decoder_out = self.decoder(trg, out, src_mask, trg_mask)
+        decoder_out = self.linear(decoder_out)
+        return decoder_out
+
 
     
 if __name__ == '__main__':
